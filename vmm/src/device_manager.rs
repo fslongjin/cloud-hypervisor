@@ -4582,7 +4582,9 @@ impl DeviceManager {
             }
         }
 
-        let (pci_device, bus_device, virtio_device, remove_dma_handler) = match pci_device_handle {
+        let (pci_device, bus_device, virtio_device, remove_dma_handler) = match pci_device_handle
+            .clone()
+        {
             // No need to remove any virtio-mem mapping here as the container outlives all devices
             PciDeviceHandle::Vfio(vfio_pci_device) => {
                 for mmio_region in vfio_pci_device.lock().unwrap().mmio_regions() {
@@ -4733,11 +4735,57 @@ impl DeviceManager {
             pci_device_bdf.to_string()
         );
 
+        // Check if this was the last VFIO device and clean up VFIO container if needed
+        self.cleanup_vfio_container_if_last_device(pci_device_handle.clone());
+
         // At this point, the device has been removed from all the list and
         // buses where it was stored. At the end of this function, after
         // any_device, bus_device and pci_device are released, the actual
         // device will be dropped.
         Ok(())
+    }
+
+    fn cleanup_vfio_container_if_last_device(&mut self, removed_device_handle: PciDeviceHandle) {
+        // Only clean up VFIO container if the removed device was a VFIO device
+        let is_vfio_device = matches!(removed_device_handle, PciDeviceHandle::Vfio(_));
+
+        if !is_vfio_device {
+            return;
+        }
+
+        // Check if there are any remaining VFIO devices
+        let device_tree = self.device_tree.lock().unwrap();
+        let has_remaining_vfio_devices = device_tree.pci_devices().iter().any(|node| {
+            if let Some(pci_device_handle) = &node.pci_device_handle {
+                matches!(pci_device_handle, PciDeviceHandle::Vfio(_))
+            } else {
+                false
+            }
+        });
+
+        // If no VFIO devices remain, clean up the VFIO container
+        if !has_remaining_vfio_devices {
+            if self.vfio_container.is_some() {
+                info!("Cleaning up VFIO container as the last VFIO device was removed");
+
+                // Remove DMA mappings from virtio-mem devices
+                for virtio_mem_device in self.virtio_mem_devices.iter() {
+                    virtio_mem_device
+                        .lock()
+                        .unwrap()
+                        .remove_dma_mapping_handler(VirtioMemMappingSource::Container)
+                        .unwrap_or_else(|e| {
+                            warn!(
+                                "Failed to remove DMA mapping handler from virtio-mem device: {}",
+                                e
+                            );
+                        });
+                }
+
+                // Clear the VFIO container reference
+                self.vfio_container = None;
+            }
+        }
     }
 
     fn hotplug_virtio_pci_device(
